@@ -257,6 +257,28 @@ public class IpNetwork extends Network {
      *                         the request could not be sent.
      */
     public void registerAsForeignDevice(final InetSocketAddress addr, final int timeToLive) throws BACnetException {
+        registerAsForeignDevice(addr, timeToLive, false);
+    }
+
+    /**
+     * Attempts an initial registration of this device as a foreign device in a BBMD. This method blocks until the
+     * response (ACK or NAK) is received, or a timeout occurs (no response).
+     *
+     * If the device is successfully registered (ACK), regular re-registration requests will be sent to maintain the
+     * registration. If any of these requests fail, the local device's exception dispatcher will be notified.
+     *
+     * If the device is to be un-registered, the registerAsForeignDevice method should be called. This will be done
+     * automatically if the local device is terminated.
+     *
+     * @param addr           The address of the BBMD where our device wants to be registered
+     * @param timeToLive     The time until we are automatically removed out of the FDT
+     * @param retryOnFailure If true, schedules periodic re-registration attempts even if the initial registration fails.
+     *                       If false, throws an exception on initial failure (existing behavior).
+     * @throws BACnetException if a timeout occurs, a NAK is received, the device is already registered as a foreign
+     *                         device, or the request could not be sent. Only thrown when retryOnFailure is false.
+     */
+    public void registerAsForeignDevice(final InetSocketAddress addr, final int timeToLive,
+            final boolean retryOnFailure) throws BACnetException {
         if (timeToLive < 1)
             throw new IllegalArgumentException("timeToLive cannot be less than 1");
         if (getTransport() == null || getTransport().getLocalDevice() == null)
@@ -270,14 +292,25 @@ public class IpNetwork extends Network {
             foreignBBMD = addr;
             foreignTTL = timeToLive;
 
+            boolean initialRegistrationSucceeded = false;
             try {
                 sendForeignDeviceRegistration();
+                initialRegistrationSucceeded = true;
             } catch (final BACnetException e) {
-                foreignBBMD = null;
-                throw e;
+                if (retryOnFailure) {
+                    // Log warning but don't throw - will retry via maintenance task
+                    LOG.warn("Initial foreign device registration failed at {}, will retry periodically: {}",
+                            addr, e.getMessage());
+                } else {
+                    // Existing behavior: reset state and throw exception
+                    foreignBBMD = null;
+                    throw e;
+                }
             }
 
-            // No exception occurred, so create a task that will re-register this device at appropriate intervals.
+            // Create a task that will re-register this device at appropriate intervals.
+            // When retryOnFailure is true, this is scheduled regardless of initial result.
+            // When retryOnFailure is false, this is only reached if initial registration succeeded.
             // Including the grace period, this should result in rereg 1 minute before expiration.
             int interval = timeToLive - 30;
             // ... but since the ttl can be less than 30, we need to correct.
@@ -297,6 +330,10 @@ public class IpNetwork extends Network {
                     }
                 }
             }, interval, interval, TimeUnit.SECONDS);
+
+            if (retryOnFailure && initialRegistrationSucceeded) {
+                LOG.info("Successfully registered as foreign device at {} after initial attempt", addr);
+            }
         }
     }
 
